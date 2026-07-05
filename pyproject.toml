@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Sheet music transcription using the Sheet Music Transformer (SMT)"
 requires-python = ">=3.11"
 dependencies = [
+    "datasets>=5.0.0",
     "loguru>=0.7.3",
     "numpy>=1.24.0",
     "opencv-python>=4.11.0.86",

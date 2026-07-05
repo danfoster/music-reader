@@ -59,12 +59,15 @@ def transcribe(image_path: str, model_key: str = "grandstaff") -> str:
     with torch.no_grad():
         predictions, _ = model.predict(tensor, convert_to_str=True)
 
-    return (
+    body = (
         "".join(predictions)
         .replace("<b>", "\n")
         .replace("<s>", " ")
         .replace("<t>", "\t")
     )
+    n_spines = body.split("\n")[0].count("\t") + 1
+    header = "\t".join(["**kern"] * n_spines)
+    return header + "\n" + body
 
 
 def main() -> None:
