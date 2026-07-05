@@ -105,7 +105,12 @@ def load_model(model_ref: str):
         import torch
         from smt_model import SMTModelForCausalLM
 
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif torch.backends.mps.is_available():
+            device = "mps"
+        else:
+            device = "cpu"
         print(f"Loading {model_ref} on {device}...", file=sys.stderr)
         model = SMTModelForCausalLM.from_pretrained(model_ref).to(device)
         model.eval()
@@ -124,8 +129,13 @@ def run_model(model, device: str, image, scale: float) -> str:
     scaled = normalize_scale(image, scale)
     tensor = img_to_tensor(scaled).unsqueeze(0).to(device)
 
+    # Cap maxlen to avoid O(N²) attention OOM on long sequences.
+    # 1200 tokens fits a full grandstaff page without memory pressure.
+    orig_maxlen = model.maxlen
+    model.maxlen = min(model.maxlen, 1200)
     with torch.no_grad():
         predictions, _ = model.predict(tensor, convert_to_str=True)
+    model.maxlen = orig_maxlen
 
     body = (
         "".join(predictions)
