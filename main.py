@@ -469,9 +469,13 @@ def main() -> None:
         help=f"Sweep scales {SCAN_SCALES} × models and keep the best result",
     )
     parser.add_argument(
+        "--output", "-o",
+        help="Output file path (default: input stem + .kern alongside input)",
+    )
+    parser.add_argument(
         "--export",
         choices=["mei", "midi"],
-        help="Also export to MEI (stdout) or MIDI (binary stdout)",
+        help="Also export to MEI or MIDI (written alongside output with .mei/.mid extension)",
     )
     parser.add_argument(
         "--repair",
@@ -541,14 +545,19 @@ def main() -> None:
         print("Validation passed.", file=sys.stderr)
 
     # Output
+    out_path = Path(args.output) if args.output else Path(args.image).with_suffix(".kern")
+    out_path.write_text(result)
+    print(f"Written: {out_path}", file=sys.stderr)
+
     if args.export:
+        ext = ".mei" if args.export == "mei" else ".mid"
+        export_path = out_path.with_suffix(ext)
         exported = export_kern(result, args.export)
         if isinstance(exported, bytes):
-            sys.stdout.buffer.write(exported)
+            export_path.write_bytes(exported)
         else:
-            print(exported)
-    else:
-        print(result)
+            export_path.write_text(exported)
+        print(f"Exported: {export_path}", file=sys.stderr)
 
 
 if __name__ == "__main__":
