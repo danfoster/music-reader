@@ -156,7 +156,30 @@ def run_model(model, device: str, image, scale: float) -> str:
         .replace("<s>", " ")
         .replace("<t>", "\t")
     )
-    n_spines = body.split("\n")[0].count("\t") + 1
+    # Determine spine count from first non-empty line
+    n_spines = 1
+    for line in body.split("\n"):
+        if line.strip():
+            n_spines = line.count("\t") + 1
+            break
+
+    # Strip spine-split (*^) and spine-merge (*v) interpretation lines —
+    # the model sometimes emits them but never follows with correct field counts.
+    # Normalize every data row to exactly n_spines fields so verovio doesn't crash.
+    normalized = []
+    for line in body.split("\n"):
+        toks = line.split("\t")
+        if any(t.strip() in ("*^", "*v") for t in toks):
+            continue
+        if line and not line.startswith("*") and not line.startswith("="):
+            # Data row: truncate extra fields or pad missing ones
+            if len(toks) > n_spines:
+                toks = toks[:n_spines]
+            elif len(toks) < n_spines:
+                toks += ["."] * (n_spines - len(toks))
+            line = "\t".join(toks)
+        normalized.append(line)
+    body = "\n".join(normalized)
     header = "\t".join(["**kern"] * n_spines)
     return header + "\n" + body
 
@@ -227,21 +250,31 @@ def validate_kern(kern: str) -> list[str]:
 
 def _capture_verovio(kern: str):
     """Run verovio.toolkit().loadData(kern), capturing stderr. Returns (toolkit, stderr_text)."""
-    import verovio
-
-    old_fd = os.dup(2)
-    tmp = tempfile.TemporaryFile()
-    os.dup2(tmp.fileno(), 2)
-    try:
-        tk = verovio.toolkit()
-        tk.loadData(kern)
-    finally:
-        os.dup2(old_fd, 2)
-        os.close(old_fd)
-        tmp.seek(0)
-        err_text = tmp.read().decode("utf-8", errors="replace")
-        tmp.close()
-    return tk, err_text
+    # Run verovio in a subprocess so a crash (e.g. std::length_error on
+    # malformed spine ops) doesn't kill the parent process.
+    script = (
+        "import sys, verovio, os, tempfile\n"
+        "kern = sys.stdin.read()\n"
+        "old = os.dup(2); tmp = tempfile.TemporaryFile()\n"
+        "os.dup2(tmp.fileno(), 2)\n"
+        "try:\n"
+        "    tk = verovio.toolkit(); tk.loadData(kern)\n"
+        "finally:\n"
+        "    os.dup2(old, 2); os.close(old)\n"
+        "    tmp.seek(0); errs = tmp.read().decode('utf-8', errors='replace'); tmp.close()\n"
+        "print(errs, end='')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        input=kern,
+        capture_output=True,
+        text=True,
+    )
+    err_text = result.stdout + result.stderr
+    # If subprocess crashed, report that as an error
+    if result.returncode not in (0, 1):
+        err_text = f"verovio subprocess exited {result.returncode}: {err_text[:200]}"
+    return err_text
 
 
 def verovio_validate(kern: str) -> list[str]:
@@ -250,7 +283,7 @@ def verovio_validate(kern: str) -> list[str]:
         import verovio  # noqa: F401
     except ImportError:
         return []
-    _, err_text = _capture_verovio(kern)
+    err_text = _capture_verovio(kern)
     return [l.strip() for l in err_text.splitlines() if l.strip()]
 
 
@@ -298,9 +331,19 @@ def score_kern(kern: str) -> tuple[int, int, bool, bool]:
 
 def export_kern(kern: str, fmt: str) -> bytes | str:
     """Export kern to another format. fmt: 'mei' or 'midi'."""
-    import base64
+    import base64, verovio, os
 
-    tk, _ = _capture_verovio(kern)
+    old_fd = os.dup(2)
+    tmp = tempfile.TemporaryFile()
+    os.dup2(tmp.fileno(), 2)
+    try:
+        tk = verovio.toolkit()
+        tk.loadData(kern)
+    finally:
+        os.dup2(old_fd, 2)
+        os.close(old_fd)
+        tmp.close()
+
     if fmt == "mei":
         return tk.getMEI()
     elif fmt == "midi":
@@ -410,34 +453,125 @@ def repair_kern(kern: str) -> tuple[str, list[str]]:
 
 
 # ---------------------------------------------------------------------------
+# System detection
+# ---------------------------------------------------------------------------
+
+def detect_systems(image) -> list:
+    """
+    Split a full-page image into individual staff-system crops.
+
+    Strategy: horizontal projection profile → mark rows as "gap" when dark
+    pixel count is below a low threshold for a minimum consecutive run.
+    Staff lines span the full width so inter-system gaps are reliably near-zero;
+    within a system, notes and beams always maintain some dark pixels.
+    """
+    import cv2
+    import numpy as np
+
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if len(image.shape) == 3 else image
+    _, binary = cv2.threshold(gray, 200, 1, cv2.THRESH_BINARY_INV)
+    proj = binary.sum(axis=1).astype(float)
+
+    # A row is a gap if it has fewer dark pixels than this fraction of the peak.
+    # 5 % catches true white rows while surviving beams/slurs that cross a row.
+    gap_threshold = proj.max() * 0.05
+
+    # A split only fires on a gap run of at least this many consecutive rows.
+    # Treble-bass intra-system gaps are ~53px; inter-system gaps are ~87px
+    # for a typical 2000px page scan. image.shape[0]//35 scales proportionally.
+    min_gap_rows = max(40, image.shape[0] // 35)
+
+    # Build a boolean gap mask
+    is_gap = proj < gap_threshold
+
+    # Find gap runs
+    split_centers = []
+    run_start = None
+    for i, g in enumerate(is_gap):
+        if g and run_start is None:
+            run_start = i
+        elif not g and run_start is not None:
+            run_len = i - run_start
+            if run_len >= min_gap_rows:
+                split_centers.append((run_start + i) // 2)
+            run_start = None
+    # Trailing whitespace: if the last gap reaches the image edge, it's
+    # not a system boundary — don't split, let it merge into the last crop.
+
+    # Build crop boundaries from split centres
+    boundaries = [0] + split_centers + [image.shape[0]]
+    padding = 10
+    min_h = max(50, image.shape[0] // 12)
+    crops = []
+    for i in range(len(boundaries) - 1):
+        s, e = boundaries[i], boundaries[i + 1]
+        if e - s >= min_h:
+            top = max(0, s - padding)
+            bot = min(image.shape[0], e + padding)
+            crops.append(image[top:bot, :])
+
+    return crops
+
+
+def concatenate_kern(parts: list[str]) -> str:
+    """
+    Merge per-system kern strings into a single score.
+    Keeps the first system's spine header; strips **kern headers from
+    subsequent systems but preserves clef/key/time interpretation changes.
+    """
+    if not parts:
+        return ""
+    if len(parts) == 1:
+        return parts[0]
+
+    n_spines = parts[0].splitlines()[0].count("\t") + 1
+    terminator = "\t".join(["*-"] * n_spines)
+
+    def strip(kern: str, first: bool) -> list[str]:
+        lines = kern.splitlines()
+        out = []
+        for line in lines:
+            toks = line.split("\t")
+            # Skip **kern spine header (only keep it for the first segment)
+            if all(t.startswith("**") for t in toks):
+                if first:
+                    out.append(line)
+                continue
+            # Skip *- terminators — we add one at the very end
+            if all(t.strip() == "*-" for t in toks):
+                continue
+            out.append(line)
+        return out
+
+    result = strip(parts[0], first=True)
+    for part in parts[1:]:
+        # Ensure a barline separates systems
+        if result and not result[-1].startswith("="):
+            result.append("\t".join(["="] * n_spines))
+        result.extend(strip(part, first=False))
+
+    result.append(terminator)
+    return "\n".join(result)
+
+
+# ---------------------------------------------------------------------------
 # Transcription entry points
 # ---------------------------------------------------------------------------
 
-def transcribe(image_path: str, model_key: str = "grandstaff", scale: float = 0.5) -> str:
-    """Single-attempt transcription."""
+def _load_image(image_path: str):
     import cv2
-
-    ensure_smt()
-    model, device = load_model(MODELS[model_key])
     image = cv2.imread(image_path)
     if image is None:
         raise FileNotFoundError(f"Cannot read image: {image_path}")
+    return image
+
+
+def _transcribe_image(image, model_key: str, scale: float) -> str:
+    model, device = load_model(MODELS[model_key])
     return run_model(model, device, image, scale)
 
 
-def transcribe_best(
-    image_path: str,
-    model_keys: list[str],
-    scales: list[float],
-) -> str:
-    """Sweep scales × models, return the candidate with the best (lowest) score."""
-    import cv2
-
-    ensure_smt()
-    image = cv2.imread(image_path)
-    if image is None:
-        raise FileNotFoundError(f"Cannot read image: {image_path}")
-
+def _transcribe_best_image(image, model_keys: list[str], scales: list[float]) -> str:
     candidates = []
     for model_key in model_keys:
         model, device = load_model(MODELS[model_key])
@@ -450,15 +584,55 @@ def transcribe_best(
                 f"    degenerate={sc[0]} verovio={sc[1]} rhythm={sc[2]} truncated={sc[3]}",
                 file=sys.stderr,
             )
-
     candidates.sort(key=lambda x: x[0])
     sc, best_model, best_scale, best_kern = candidates[0]
     print(
-        f"\nBest: model={best_model} scale={best_scale} "
+        f"  Best: model={best_model} scale={best_scale} "
         f"degenerate={sc[0]} verovio={sc[1]} rhythm={sc[2]} truncated={sc[3]}",
         file=sys.stderr,
     )
     return best_kern
+
+
+def transcribe(image_path: str, model_key: str = "grandstaff", scale: float = 0.5) -> str:
+    ensure_smt()
+    return _transcribe_image(_load_image(image_path), model_key, scale)
+
+
+def transcribe_best(image_path: str, model_keys: list[str], scales: list[float]) -> str:
+    ensure_smt()
+    return _transcribe_best_image(_load_image(image_path), model_keys, scales)
+
+
+def transcribe_systems(
+    image_path: str,
+    model_keys: list[str],
+    scales: list[float],
+    use_scan: bool = False,
+) -> str:
+    """
+    Detect staff systems, transcribe each one, concatenate results.
+    When use_scan=True, sweeps scales × models per system.
+    When use_scan=False, uses scales[0] and model_keys[0].
+    """
+    ensure_smt()
+    image = _load_image(image_path)
+    crops = detect_systems(image)
+    n = len(crops)
+    print(f"Detected {n} system(s)", file=sys.stderr)
+    if n == 0:
+        raise RuntimeError("No staff systems detected in image")
+
+    parts = []
+    for i, crop in enumerate(crops):
+        print(f"\nSystem {i + 1}/{n}:", file=sys.stderr)
+        if use_scan:
+            kern = _transcribe_best_image(crop, model_keys, scales)
+        else:
+            kern = _transcribe_image(crop, model_keys[0], scales[0])
+        parts.append(kern)
+
+    return concatenate_kern(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -492,6 +666,11 @@ def main() -> None:
         help=f"Sweep scales {SCAN_SCALES} × models and keep the best result",
     )
     parser.add_argument(
+        "--systems",
+        action="store_true",
+        help="Detect individual staff systems and transcribe each separately (recommended for full pages)",
+    )
+    parser.add_argument(
         "--output", "-o",
         help="Output file path (default: input stem + .kern alongside input)",
     )
@@ -520,12 +699,19 @@ def main() -> None:
         subprocess.run(["git", "-C", str(SMT_DIR), "pull"], check=True)
 
     # Inference
-    if args.scan:
-        model_keys = (
-            [k.strip() for k in args.models.split(",")]
-            if args.models
-            else [args.model]
+    model_keys = (
+        [k.strip() for k in args.models.split(",")]
+        if args.models
+        else [args.model]
+    )
+    if args.systems:
+        result = transcribe_systems(
+            args.image,
+            model_keys,
+            SCAN_SCALES if args.scan else [args.scale],
+            use_scan=args.scan,
         )
+    elif args.scan:
         result = transcribe_best(args.image, model_keys, SCAN_SCALES)
     else:
         result = transcribe(args.image, args.model, args.scale)
