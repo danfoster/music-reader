@@ -377,19 +377,6 @@ def repair_kern(kern: str) -> tuple[str, list[str]]:
     repairs: list[str] = []
     beats_per_measure: Fraction | None = None
     n_spines = 0
-
-    for line in kern.splitlines():
-        toks = line.split("\t")
-        if toks[0].startswith("**"):
-            n_spines = len(toks)
-        for tok in toks:
-            m = re.match(r"^\*M(\d+)/(\d+)$", tok)
-            if m:
-                beats_per_measure = Fraction(int(m.group(1)) * 4, int(m.group(2)))
-
-    if beats_per_measure is None or n_spines == 0:
-        return kern, repairs
-
     out_lines: list[str] = []
     measure_data: list[str] = []
     first_measure = True
@@ -397,6 +384,10 @@ def repair_kern(kern: str) -> tuple[str, list[str]]:
 
     def flush() -> None:
         nonlocal first_measure, measure_num
+        if beats_per_measure is None or n_spines == 0:
+            out_lines.extend(measure_data)
+            measure_data.clear()
+            return
         totals = [Fraction(0)] * n_spines
         for ln in measure_data:
             for i, tok in enumerate(ln.split("\t")):
@@ -438,7 +429,15 @@ def repair_kern(kern: str) -> tuple[str, list[str]]:
 
     for line in kern.splitlines():
         toks = line.split("\t")
-        if toks[0].startswith("**") or toks[0].startswith("*"):
+        if toks[0].startswith("**"):
+            n_spines = len(toks)
+            out_lines.append(line)
+        elif toks[0].startswith("*"):
+            # Track time signature changes inline (same as validate_kern)
+            for tok in toks:
+                m = re.match(r"^\*M(\d+)/(\d+)$", tok)
+                if m:
+                    beats_per_measure = Fraction(int(m.group(1)) * 4, int(m.group(2)))
             out_lines.append(line)
         elif toks[0].startswith("="):
             flush()
