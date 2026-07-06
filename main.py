@@ -352,6 +352,90 @@ def export_kern(kern: str, fmt: str) -> bytes | str:
 
 
 # ---------------------------------------------------------------------------
+# WAV synthesis (MIDI → WAV via additive synthesis, no external deps)
+# ---------------------------------------------------------------------------
+
+def kern_to_wav(kern: str, out_path: Path, sample_rate: int = 44100) -> None:
+    """Render kern to a WAV file via verovio MIDI + numpy additive synthesis."""
+    import io, wave
+    import mido
+    import numpy as np
+
+    midi_bytes = export_kern(kern, "midi")
+    mid = mido.MidiFile(file=io.BytesIO(midi_bytes))
+
+    tempo = 500000
+    tpb = mid.ticks_per_beat
+    active: dict[tuple[int, int], tuple[float, int]] = {}
+    notes: list[tuple[float, float, int, int]] = []
+    abs_sec = 0.0
+
+    for msg in mido.merge_tracks(mid.tracks):
+        abs_sec += mido.tick2second(msg.time, tpb, tempo)
+        if msg.type == "set_tempo":
+            tempo = msg.tempo
+        elif msg.type == "note_on" and msg.velocity > 0:
+            active[(msg.channel, msg.note)] = (abs_sec, msg.velocity)
+        elif msg.type in ("note_off",) or (msg.type == "note_on" and msg.velocity == 0):
+            key = (msg.channel, msg.note)
+            if key in active:
+                start, vel = active.pop(key)
+                notes.append((start, abs_sec, msg.note, vel))
+
+    for (_, note), (start, vel) in active.items():
+        notes.append((start, abs_sec + 0.5, note, vel))
+
+    if not notes:
+        raise RuntimeError("No MIDI notes found in rendered output")
+
+    total = max(end for _, end, _, _ in notes) + 0.5
+    n_samples = int(total * sample_rate)
+    buf = np.zeros(n_samples, dtype=np.float64)
+
+    for start, end, pitch, velocity in notes:
+        freq = 440.0 * (2.0 ** ((pitch - 69) / 12.0))
+        dur = max(end - start, 0.01)
+        n = min(int(dur * sample_rate), n_samples - int(start * sample_rate))
+        if n <= 0:
+            continue
+        t = np.linspace(0.0, dur, n, endpoint=False)
+        # Additive synthesis: fundamental + harmonics (piano-like timbre)
+        sig = (
+            np.sin(2 * np.pi * freq * t) * 0.50
+            + np.sin(2 * np.pi * 2 * freq * t) * 0.20
+            + np.sin(2 * np.pi * 3 * freq * t) * 0.10
+            + np.sin(2 * np.pi * 4 * freq * t) * 0.05
+        )
+        # ADSR envelope
+        a = min(int(0.005 * sample_rate), n // 4)
+        d = min(int(0.06 * sample_rate), n // 3)
+        r = min(int(0.08 * sample_rate), n // 4)
+        s_len = max(n - a - d - r, 0)
+        sustain = 0.65
+        env = np.concatenate([
+            np.linspace(0, 1, a),
+            np.linspace(1, sustain, d),
+            np.full(s_len, sustain),
+            np.linspace(sustain, 0, r),
+        ])[:n]
+        sig = sig * env * (velocity / 127.0) * 0.6
+
+        i0 = int(start * sample_rate)
+        buf[i0 : i0 + n] += sig
+
+    peak = np.max(np.abs(buf))
+    if peak > 0:
+        buf = buf / peak * 0.9
+
+    pcm = (buf * 32767).astype(np.int16)
+    with wave.open(str(out_path), "w") as wf:
+        wf.setnchannels(1)
+        wf.setsampwidth(2)
+        wf.setframerate(sample_rate)
+        wf.writeframes(pcm.tobytes())
+
+
+# ---------------------------------------------------------------------------
 # Repair (opt-in, last resort)
 # ---------------------------------------------------------------------------
 
@@ -766,6 +850,11 @@ def main() -> None:
         help="Also export to MEI or MIDI (written alongside output with .mei/.mid extension)",
     )
     parser.add_argument(
+        "--no-wav",
+        action="store_true",
+        help="Skip WAV audio rendering (WAV is written by default alongside the kern output)",
+    )
+    parser.add_argument(
         "--repair",
         action="store_true",
         help=(
@@ -849,6 +938,14 @@ def main() -> None:
     out_path = Path(args.output) if args.output else Path(args.image).with_suffix(".kern")
     out_path.write_text(result)
     print(f"Written: {out_path}", file=sys.stderr)
+
+    if not args.no_wav:
+        wav_path = out_path.with_suffix(".wav")
+        try:
+            kern_to_wav(result, wav_path)
+            print(f"Written: {wav_path}", file=sys.stderr)
+        except Exception as e:
+            print(f"WAV render failed: {e}", file=sys.stderr)
 
     if args.export:
         ext = ".mei" if args.export == "mei" else ".mid"
