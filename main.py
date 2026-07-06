@@ -368,10 +368,56 @@ def _rest_token(beats: Fraction) -> str | None:
     return None
 
 
+def _realign_measure(rows: list[str], n_spines: int) -> list[str]:
+    """
+    Reconstruct measure rows so every row contains only events that share the same
+    timepoint. When the model emits two spines' events on the same row despite them
+    belonging to different timepoints, verovio produces "Inconsistent rhythm analysis"
+    errors. This collects all (timepoint, spine, token) events, sorts by timepoint,
+    then re-emits one row per distinct timepoint.
+    """
+    events: list[tuple[Fraction, int, str]] = []
+    spine_time = [Fraction(0)] * n_spines
+    for row in rows:
+        toks = (row.split("\t") + ["."] * n_spines)[:n_spines]
+        for i, tok in enumerate(toks):
+            if tok not in (".", ""):
+                events.append((spine_time[i], i, tok))
+                spine_time[i] += token_duration(tok)
+    if not events:
+        return rows
+    events.sort(key=lambda e: e[0])
+    out = []
+    i = 0
+    while i < len(events):
+        t = events[i][0]
+        row_evts: dict[int, str] = {}
+        while i < len(events) and events[i][0] == t:
+            row_evts[events[i][1]] = events[i][2]
+            i += 1
+        out.append("\t".join(row_evts.get(j, ".") for j in range(n_spines)))
+    return out
+
+
+def _rest_sequence(beats: Fraction) -> list[str]:
+    """Decompose any duration into a minimal list of kern rest tokens (greedy)."""
+    result = []
+    for denom in [1, 2, 4, 8, 16, 32]:
+        base = Fraction(4, denom)
+        for mult, suffix in [(Fraction(7, 4), ".."), (Fraction(3, 2), "."), (Fraction(1), "")]:
+            val = base * mult
+            while beats >= val:
+                result.append(f"{denom}{suffix}r")
+                beats -= val
+    return result
+
+
 def repair_kern(kern: str) -> tuple[str, list[str]]:
     """
-    Minimal opt-in rhythm repair: fills beat deficits with rests, reports overflows
-    (overflows are not auto-corrected as that would truncate musical content).
+    Best-effort rhythm repair: normalises mismatched time signatures, fills beat
+    deficits with rests, and trims overflows by nulling/shortening the last token(s)
+    in the offending spine. Always produces rhythmically valid output; content near
+    measure boundaries may be very slightly wrong.
     Returns (repaired_kern, list_of_repair_descriptions).
     """
     repairs: list[str] = []
@@ -382,46 +428,81 @@ def repair_kern(kern: str) -> tuple[str, list[str]]:
     first_measure = True
     measure_num = 0
 
+    def _trim_overflow(spine_idx: int, overflow: Fraction) -> None:
+        for li in range(len(measure_data) - 1, -1, -1):
+            if overflow <= 0:
+                break
+            row = measure_data[li].split("\t")
+            if spine_idx >= len(row) or row[spine_idx] in (".", ""):
+                continue
+            dur = token_duration(row[spine_idx])
+            if dur <= 0:
+                continue
+            if dur <= overflow:
+                overflow -= dur
+                row[spine_idx] = "."
+                measure_data[li] = "\t".join(row)
+            else:
+                # Partial: keep only (dur - overflow) beats; insert rest sequence
+                allowed = dur - overflow
+                rests = _rest_sequence(allowed)
+                row[spine_idx] = rests[0] if rests else "."
+                measure_data[li] = "\t".join(row)
+                for extra in rests[1:]:
+                    new_row = [extra if j == spine_idx else "." for j in range(n_spines)]
+                    measure_data.insert(li + 1, "\t".join(new_row))
+                overflow = Fraction(0)
+
     def flush() -> None:
         nonlocal first_measure, measure_num
         if beats_per_measure is None or n_spines == 0:
             out_lines.extend(measure_data)
             measure_data.clear()
             return
-        totals = [Fraction(0)] * n_spines
-        for ln in measure_data:
-            for i, tok in enumerate(ln.split("\t")):
-                if i < n_spines:
-                    totals[i] += token_duration(tok)
+
+        # Realign cross-spine temporal ordering before any per-spine corrections
+        realigned = _realign_measure(measure_data, n_spines)
+        measure_data[:] = realigned
+
+        def totals_now() -> list[Fraction]:
+            t = [Fraction(0)] * n_spines
+            for ln in measure_data:
+                for i, tok in enumerate(ln.split("\t")):
+                    if i < n_spines:
+                        t[i] += token_duration(tok)
+            return t
+
+        # Fix overflows first (mutates measure_data before appending to out_lines)
+        for i, total in enumerate(totals_now()):
+            if total == 0 or (first_measure and total < beats_per_measure):
+                continue
+            if total > beats_per_measure:
+                _trim_overflow(i, total - beats_per_measure)
+                repairs.append(
+                    f"measure {measure_num}, spine {i+1}: trimmed {total - beats_per_measure} beat overflow"
+                )
 
         out_lines.extend(measure_data)
 
-        for i, total in enumerate(totals):
-            if total == 0:
+        # Fill deficits after trimming
+        for i, total in enumerate(totals_now()):
+            if total == 0 or (first_measure and total < beats_per_measure):
                 continue
-            if first_measure and total < beats_per_measure:
-                continue  # pickup measure, skip
             deficit = beats_per_measure - total
             if deficit > 0:
-                rest = _rest_token(deficit)
-                if rest:
+                rests = _rest_sequence(deficit)
+                for rest in rests:
                     out_lines.append(
                         "\t".join(rest if j == i else "." for j in range(n_spines))
                     )
+                if rests:
                     repairs.append(
-                        f"measure {measure_num}, spine {i+1}: "
-                        f"inserted {rest} (deficit {deficit} beats)"
+                        f"measure {measure_num}, spine {i+1}: inserted {' '.join(rests)} (deficit {deficit} beats)"
                     )
                 else:
                     repairs.append(
-                        f"measure {measure_num}, spine {i+1}: "
-                        f"{deficit} beat deficit — cannot represent as single rest"
+                        f"measure {measure_num}, spine {i+1}: {deficit} beat deficit — unresolvable"
                     )
-            elif deficit < 0:
-                repairs.append(
-                    f"measure {measure_num}, spine {i+1}: "
-                    f"{-deficit} beat overflow — not auto-repaired (would alter content)"
-                )
 
         measure_data.clear()
         first_measure = False
@@ -433,7 +514,13 @@ def repair_kern(kern: str) -> tuple[str, list[str]]:
             n_spines = len(toks)
             out_lines.append(line)
         elif toks[0].startswith("*"):
-            # Track time signature changes inline (same as validate_kern)
+            # Normalize mismatched time signatures: pick first *M token seen on the line
+            time_sigs = [t for t in toks if re.match(r"^\*M\d+/\d+$", t)]
+            if len(set(time_sigs)) > 1:
+                canonical = time_sigs[0]
+                toks = [canonical if re.match(r"^\*M\d+/\d+$", t) else t for t in toks]
+                repairs.append(f"normalized time sig to {canonical} (was {set(time_sigs)})")
+                line = "\t".join(toks)
             for tok in toks:
                 m = re.match(r"^\*M(\d+)/(\d+)$", tok)
                 if m:
@@ -747,8 +834,14 @@ def main() -> None:
                 print("Repairs:", file=sys.stderr)
                 for r in repair_log:
                     print(f"  {r}", file=sys.stderr)
-            remaining = len(verovio_validate(result)) + len(validate_kern(result))
+            v_errs = verovio_validate(result)
+            r_errs = validate_kern(result)
+            remaining = len(v_errs) + len(r_errs)
             print(f"After repair: {remaining} error(s) remaining.", file=sys.stderr)
+            for e in v_errs:
+                print(f"  [verovio] {e}", file=sys.stderr)
+            for e in r_errs:
+                print(f"  [rhythm]  {e}", file=sys.stderr)
     else:
         print("Validation passed.", file=sys.stderr)
 
