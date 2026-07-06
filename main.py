@@ -171,12 +171,13 @@ def run_model(model, device: str, image, scale: float) -> str:
         toks = line.split("\t")
         if any(t.strip() in ("*^", "*v") for t in toks):
             continue
-        if line and not line.startswith("*") and not line.startswith("="):
-            # Data row: truncate extra fields or pad missing ones
+        if line and not line.startswith("*"):
+            # Data rows and barlines: normalize field count to n_spines
             if len(toks) > n_spines:
                 toks = toks[:n_spines]
             elif len(toks) < n_spines:
-                toks += ["."] * (n_spines - len(toks))
+                fill = "=" if line.startswith("=") else "."
+                toks += [fill] * (n_spines - len(toks))
             line = "\t".join(toks)
         normalized.append(line)
     body = "\n".join(normalized)
@@ -330,25 +331,36 @@ def score_kern(kern: str) -> tuple[int, int, bool, bool]:
 # ---------------------------------------------------------------------------
 
 def export_kern(kern: str, fmt: str) -> bytes | str:
-    """Export kern to another format. fmt: 'mei' or 'midi'."""
-    import base64, verovio, os
+    """Export kern to another format. fmt: 'mei' or 'midi'. Runs in a subprocess to isolate verovio crashes."""
+    import base64
 
-    old_fd = os.dup(2)
-    tmp = tempfile.TemporaryFile()
-    os.dup2(tmp.fileno(), 2)
-    try:
-        tk = verovio.toolkit()
-        tk.loadData(kern)
-    finally:
-        os.dup2(old_fd, 2)
-        os.close(old_fd)
-        tmp.close()
+    if fmt not in ("mei", "midi"):
+        raise ValueError(f"Unsupported export format: {fmt!r}")
 
+    # renderToMIDI already returns base64 text, so we keep everything in text mode
+    # and decode on the parent side for MIDI.
+    script = """
+import sys, verovio
+kern = sys.stdin.read()
+tk = verovio.toolkit()
+tk.loadData(kern)
+fmt = sys.argv[1]
+if fmt == 'mei':
+    sys.stdout.write(tk.getMEI())
+else:
+    sys.stdout.write(tk.renderToMIDI())  # already base64 text
+"""
+    proc = subprocess.run(
+        [sys.executable, "-c", script, fmt],
+        input=kern,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        raise RuntimeError(f"verovio export failed (exit {proc.returncode}): {proc.stderr[:200]}")
     if fmt == "mei":
-        return tk.getMEI()
-    elif fmt == "midi":
-        return base64.b64decode(tk.renderToMIDI())
-    raise ValueError(f"Unsupported export format: {fmt!r}")
+        return proc.stdout
+    return base64.b64decode(proc.stdout)
 
 
 # ---------------------------------------------------------------------------
@@ -992,7 +1004,9 @@ def main() -> None:
     if not args.no_wav:
         wav_path = out_path.with_suffix(".wav")
         try:
-            kern_to_wav(result, wav_path)
+            # Always repair before rendering audio — invalid kern causes verovio SIGABRT
+            kern_for_wav, _ = repair_kern(result) if n_errors > 0 else (result, [])
+            kern_to_wav(kern_for_wav, wav_path)
             print(f"Written: {wav_path}", file=sys.stderr)
         except Exception as e:
             print(f"WAV render failed: {e}", file=sys.stderr)
