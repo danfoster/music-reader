@@ -39,9 +39,22 @@ def ensure_smt() -> None:
             ["git", "clone", "--depth=1", SMT_REPO, str(SMT_DIR)],
             check=True,
         )
+    _patch_smt()
     smt_str = str(SMT_DIR)
     if smt_str not in sys.path:
         sys.path.insert(0, smt_str)
+
+
+def _patch_smt() -> None:
+    """Apply fixes to the SMT clone that haven't landed upstream."""
+    cfg_path = SMT_DIR / "smt_model" / "configuration_smt.py"
+    text = cfg_path.read_text()
+    # SMTConfig.__init__ never calls super().__init__(**kwargs), leaving
+    # PretrainedConfig base attributes uninitialised.
+    needle = "        self.architectures = [\"SMT\"]"
+    replacement = "        super().__init__(**kwargs)\n" + needle
+    if "super().__init__" not in text:
+        cfg_path.write_text(text.replace(needle, replacement))
 
 
 # ---------------------------------------------------------------------------
