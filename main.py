@@ -774,6 +774,42 @@ def transcribe_best(image_path: str, model_keys: list[str], scales: list[float])
     return _transcribe_best_image(_load_image(image_path), model_keys, scales)
 
 
+def _transcribe_page(
+    image,
+    model_keys: list[str],
+    scales: list[float],
+    use_scan: bool,
+    page_label: str = "",
+) -> list[str]:
+    """Detect systems on one page image and return a list of per-system kern strings."""
+    crops = detect_systems(image)
+    n = len(crops)
+    label = f"{page_label}: " if page_label else ""
+    print(f"{label}Detected {n} system(s)", file=sys.stderr)
+    parts = []
+    for i, crop in enumerate(crops):
+        print(f"\n{label}System {i + 1}/{n}:", file=sys.stderr)
+        kern = _transcribe_best_image(crop, model_keys, scales) if use_scan else _transcribe_image(crop, model_keys[0], scales[0])
+        parts.append(kern)
+    return parts
+
+
+def pdf_to_page_images(pdf_path: str, dpi: int = 200):
+    """Yield each page of a PDF as a numpy BGR image (same format as cv2.imread)."""
+    import fitz
+    import numpy as np
+    scale = dpi / 72.0
+    doc = fitz.open(pdf_path)
+    for page in doc:
+        pix = page.get_pixmap(matrix=fitz.Matrix(scale, scale))
+        img = np.frombuffer(pix.samples, dtype=np.uint8).reshape(pix.h, pix.w, pix.n)
+        if pix.n == 4:
+            img = img[:, :, :3]
+        # fitz gives RGB; cv2 expects BGR
+        yield img[:, :, ::-1].copy()
+    doc.close()
+
+
 def transcribe_systems(
     image_path: str,
     model_keys: list[str],
@@ -781,28 +817,34 @@ def transcribe_systems(
     use_scan: bool = False,
 ) -> str:
     """
-    Detect staff systems, transcribe each one, concatenate results.
+    Detect staff systems on one image, transcribe each, concatenate results.
     When use_scan=True, sweeps scales × models per system.
-    When use_scan=False, uses scales[0] and model_keys[0].
     """
     ensure_smt()
     image = _load_image(image_path)
-    crops = detect_systems(image)
-    n = len(crops)
-    print(f"Detected {n} system(s)", file=sys.stderr)
-    if n == 0:
+    parts = _transcribe_page(image, model_keys, scales, use_scan)
+    if not parts:
         raise RuntimeError("No staff systems detected in image")
-
-    parts = []
-    for i, crop in enumerate(crops):
-        print(f"\nSystem {i + 1}/{n}:", file=sys.stderr)
-        if use_scan:
-            kern = _transcribe_best_image(crop, model_keys, scales)
-        else:
-            kern = _transcribe_image(crop, model_keys[0], scales[0])
-        parts.append(kern)
-
     return concatenate_kern(parts)
+
+
+def transcribe_pdf(
+    pdf_path: str,
+    model_keys: list[str],
+    scales: list[float],
+    use_scan: bool = False,
+    dpi: int = 200,
+) -> str:
+    """Transcribe all pages of a PDF and concatenate into a single kern string."""
+    ensure_smt()
+    all_parts: list[str] = []
+    for page_num, image in enumerate(pdf_to_page_images(pdf_path, dpi=dpi), start=1):
+        print(f"\n=== Page {page_num} ===", file=sys.stderr)
+        parts = _transcribe_page(image, model_keys, scales, use_scan, page_label=f"p{page_num}")
+        all_parts.extend(parts)
+    if not all_parts:
+        raise RuntimeError("No staff systems detected in PDF")
+    return concatenate_kern(all_parts)
 
 
 # ---------------------------------------------------------------------------
@@ -879,7 +921,15 @@ def main() -> None:
         if args.models
         else [args.model]
     )
-    if args.systems:
+    is_pdf = Path(args.image).suffix.lower() == ".pdf"
+    if is_pdf:
+        result = transcribe_pdf(
+            args.image,
+            model_keys,
+            SCAN_SCALES if args.scan else [args.scale],
+            use_scan=args.scan,
+        )
+    elif args.systems:
         result = transcribe_systems(
             args.image,
             model_keys,
